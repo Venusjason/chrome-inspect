@@ -1,0 +1,212 @@
+WebInspector.LayerTree=function(model,treeOutline)
+{WebInspector.Object.call(this);this._model=model;this._treeOutline=treeOutline;this._treeOutline.childrenListElement.addEventListener("mousemove",this._onMouseMove.bind(this),false);this._treeOutline.childrenListElement.addEventListener("mouseout",this._onMouseMove.bind(this),false);this._treeOutline.childrenListElement.addEventListener("contextmenu",this._onContextMenu.bind(this),true);this._model.addEventListener(WebInspector.LayerTreeModel.Events.LayerTreeChanged,this._update.bind(this));this._lastHoveredNode=null;}
+WebInspector.LayerTree.Events={LayerHovered:"LayerHovered",LayerSelected:"LayerSelected"}
+WebInspector.LayerTree.prototype={selectLayer:function(layer)
+{this.hoverLayer(null);var node=layer&&this._treeOutline.getCachedTreeElement(layer);if(node)
+node.revealAndSelect(true);else if(this._treeOutline.selectedTreeElement)
+this._treeOutline.selectedTreeElement.deselect();},hoverLayer:function(layer)
+{var node=layer&&this._treeOutline.getCachedTreeElement(layer);if(node===this._lastHoveredNode)
+return;if(this._lastHoveredNode)
+this._lastHoveredNode.setHovered(false);if(node)
+node.setHovered(true);this._lastHoveredNode=node;},_update:function()
+{var seenLayers={};function updateLayer(layer)
+{var id=layer.id();if(seenLayers[id])
+console.assert(false,"Duplicate layer id: "+id);seenLayers[id]=true;var node=this._treeOutline.getCachedTreeElement(layer);var parent=layer===this._model.contentRoot()?this._treeOutline:this._treeOutline.getCachedTreeElement(layer.parent());if(!parent)
+console.assert(false,"Parent is not in the tree");if(!node){node=new WebInspector.LayerTreeElement(this,layer);parent.appendChild(node);}else{if(node.parent!==parent){node.parent.removeChild(node);parent.appendChild(node);}
+node._update();}}
+if(this._model.contentRoot())
+this._model.forEachLayer(updateLayer.bind(this),this._model.contentRoot());for(var node=(this._treeOutline.children[0]);node&&!node.root;){if(seenLayers[node.representedObject.id()]){node=node.traverseNextTreeElement(false);}else{var nextNode=node.nextSibling||node.parent;node.parent.removeChild(node);if(node===this._lastHoveredNode)
+this._lastHoveredNode=null;node=nextNode;}}},_onMouseMove:function(event)
+{var node=this._treeOutline.treeElementFromPoint(event.pageX,event.pageY);if(node===this._lastHoveredNode)
+return;this.dispatchEventToListeners(WebInspector.LayerTree.Events.LayerHovered,node&&node.representedObject?{layer:node.representedObject}:null);},_selectedNodeChanged:function(node)
+{var layer=(node.representedObject);this.dispatchEventToListeners(WebInspector.LayerTree.Events.LayerSelected,{layer:layer});},_onContextMenu:function(event)
+{var node=this._treeOutline.treeElementFromPoint(event.pageX,event.pageY);if(!node||!node.representedObject)
+return;var layer=(node.representedObject);if(!layer)
+return;var domNode=layer.nodeForSelfOrAncestor();if(!domNode)
+return;var contextMenu=new WebInspector.ContextMenu(event);contextMenu.appendApplicableItems(domNode);contextMenu.show();},__proto__:WebInspector.Object.prototype}
+WebInspector.LayerTreeElement=function(tree,layer)
+{TreeElement.call(this,"",layer);this._layerTree=tree;this._update();}
+WebInspector.LayerTreeElement.prototype={onattach:function()
+{var selection=document.createElement("div");selection.className="selection";this.listItemElement.insertBefore(selection,this.listItemElement.firstChild);},_update:function()
+{var layer=(this.representedObject);var node=layer.nodeForSelfOrAncestor();var title=document.createDocumentFragment();title.createChild("div","selection");title.appendChild(document.createTextNode(node?WebInspector.DOMPresentationUtils.simpleSelector(node):"#"+layer.id()));var details=title.createChild("span","dimmed");details.textContent=WebInspector.UIString(" (%d × %d)",layer.width(),layer.height());this.title=title;},onselect:function()
+{this._layerTree._selectedNodeChanged(this);return false;},setHovered:function(hovered)
+{this.listItemElement.classList.toggle("hovered",hovered);},__proto__:TreeElement.prototype};WebInspector.Layers3DView=function(model)
+{WebInspector.VBox.call(this);this.element.classList.add("layers-3d-view");this._emptyView=new WebInspector.EmptyView(WebInspector.UIString("Not in the composited mode.\nConsider forcing composited mode in Settings."));this._model=model;this._model.addEventListener(WebInspector.LayerTreeModel.Events.LayerTreeChanged,this._update,this);this._model.addEventListener(WebInspector.LayerTreeModel.Events.LayerPainted,this._onLayerPainted,this);this._canvasElement=this.element.createChild("canvas");this._transformController=new WebInspector.TransformController(this._canvasElement);this._transformController.addEventListener(WebInspector.TransformController.Events.TransformChanged,this._update,this);this._canvasElement.addEventListener("dblclick",this._onDoubleClick.bind(this),false);this._canvasElement.addEventListener("mousedown",this._onMouseDown.bind(this),false);this._canvasElement.addEventListener("mouseup",this._onMouseUp.bind(this),false);this._canvasElement.addEventListener("mouseout",this._onMouseMove.bind(this),false);this._canvasElement.addEventListener("mousemove",this._onMouseMove.bind(this),false);this._canvasElement.addEventListener("contextmenu",this._onContextMenu.bind(this),false);this._lastActiveObject={};this._textureForLayer={};this._scrollRectQuadsForLayer={};this._isVisible={};WebInspector.settings.showPaintRects.addChangeListener(this._update,this);}
+WebInspector.Layers3DView.OutlineType={Hovered:"hovered",Selected:"selected"}
+WebInspector.Layers3DView.Events={ObjectHovered:"ObjectHovered",ObjectSelected:"ObjectSelected",LayerSnapshotRequested:"LayerSnapshotRequested"}
+WebInspector.Layers3DView.ScrollRectTitles={RepaintsOnScroll:WebInspector.UIString("repaints on scroll"),TouchEventHandler:WebInspector.UIString("touch event listener"),WheelEventHandler:WebInspector.UIString("mousewheel event listener")}
+WebInspector.Layers3DView.FragmentShader="\
+    precision mediump float;\
+    varying vec4 vColor;\
+    varying vec2 vTextureCoord;\
+    uniform sampler2D uSampler;\
+    void main(void)\
+    {\
+        gl_FragColor = texture2D(uSampler, vec2(vTextureCoord.s, vTextureCoord.t)) * vColor;\
+    }";WebInspector.Layers3DView.VertexShader="\
+    attribute vec3 aVertexPosition;\
+    attribute vec2 aTextureCoord;\
+    attribute vec4 aVertexColor;\
+    uniform mat4 uPMatrix;\
+    varying vec2 vTextureCoord;\
+    varying vec4 vColor;\
+    void main(void)\
+    {\
+        gl_Position = uPMatrix * vec4(aVertexPosition, 1.0);\
+        vColor = aVertexColor;\
+        vTextureCoord = aTextureCoord;\
+    }";WebInspector.Layers3DView.SelectedBackgroundColor=[20,40,110,0.66];WebInspector.Layers3DView.BackgroundColor=[0,0,0,0];WebInspector.Layers3DView.HoveredBorderColor=[0,0,255,1];WebInspector.Layers3DView.BorderColor=[0,0,0,1];WebInspector.Layers3DView.ScrollRectBackgroundColor=[178,0,0,0.4];WebInspector.Layers3DView.SelectedScrollRectBackgroundColor=[178,0,0,0.6];WebInspector.Layers3DView.ScrollRectBorderColor=[178,0,0,1];WebInspector.Layers3DView.LayerSpacing=20;WebInspector.Layers3DView.ScrollRectSpacing=4;WebInspector.Layers3DView.prototype={registerShortcuts:function(registerShortcutDelegate)
+{this._transformController.registerShortcuts(registerShortcutDelegate);},onResize:function()
+{this._update();},willHide:function()
+{},wasShown:function()
+{if(this._needsUpdate)
+this._update();},_setOutline:function(type,activeObject)
+{this._lastActiveObject[type]=activeObject;this._update();},hoverObject:function(activeObject)
+{this._setOutline(WebInspector.Layers3DView.OutlineType.Hovered,activeObject);},selectObject:function(activeObject)
+{this._setOutline(WebInspector.Layers3DView.OutlineType.Hovered,null);this._setOutline(WebInspector.Layers3DView.OutlineType.Selected,activeObject);},showImageForLayer:function(layer,imageURL)
+{var texture=this._gl.createTexture();texture.image=new Image();texture.image.addEventListener("load",this._handleLoadedTexture.bind(this,texture,layer.id()),false);texture.image.src=imageURL;},_initGL:function(canvas)
+{var gl=canvas.getContext("webgl");gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);gl.enable(gl.BLEND);gl.clearColor(0.0,0.0,0.0,0.0);gl.enable(gl.DEPTH_TEST);return gl;},_createShader:function(type,script)
+{var shader=this._gl.createShader(type);this._gl.shaderSource(shader,script);this._gl.compileShader(shader);this._gl.attachShader(this._shaderProgram,shader);},_enableVertexAttribArray:function(attributeName,glName)
+{this._shaderProgram[attributeName]=this._gl.getAttribLocation(this._shaderProgram,glName);this._gl.enableVertexAttribArray(this._shaderProgram[attributeName]);},_initShaders:function()
+{this._shaderProgram=this._gl.createProgram();this._createShader(this._gl.FRAGMENT_SHADER,WebInspector.Layers3DView.FragmentShader);this._createShader(this._gl.VERTEX_SHADER,WebInspector.Layers3DView.VertexShader);this._gl.linkProgram(this._shaderProgram);this._gl.useProgram(this._shaderProgram);this._shaderProgram.vertexPositionAttribute=this._gl.getAttribLocation(this._shaderProgram,"aVertexPosition");this._gl.enableVertexAttribArray(this._shaderProgram.vertexPositionAttribute);this._shaderProgram.vertexColorAttribute=this._gl.getAttribLocation(this._shaderProgram,"aVertexColor");this._gl.enableVertexAttribArray(this._shaderProgram.vertexColorAttribute);this._shaderProgram.textureCoordAttribute=this._gl.getAttribLocation(this._shaderProgram,"aTextureCoord");this._gl.enableVertexAttribArray(this._shaderProgram.textureCoordAttribute);this._shaderProgram.pMatrixUniform=this._gl.getUniformLocation(this._shaderProgram,"uPMatrix");this._shaderProgram.samplerUniform=this._gl.getUniformLocation(this._shaderProgram,"uSampler");},_resizeCanvas:function()
+{this._canvasElement.width=this._canvasElement.offsetWidth*window.devicePixelRatio;this._canvasElement.height=this._canvasElement.offsetHeight*window.devicePixelRatio;this._gl.viewportWidth=this._canvasElement.width;this._gl.viewportHeight=this._canvasElement.height;},_calculateProjectionMatrix:function()
+{var rootLayerPadding=20;var rootWidth=this._model.contentRoot().width();var rootHeight=this._model.contentRoot().height();var canvasWidth=this._canvasElement.width;var canvasHeight=this._canvasElement.height;var scaleX=(canvasWidth-rootLayerPadding)/rootWidth;var scaleY=(canvasHeight-rootLayerPadding)/rootHeight;var viewScale=Math.min(scaleX,scaleY);var scale=this._transformController.scale();var offsetX=this._transformController.offsetX()*window.devicePixelRatio;var offsetY=this._transformController.offsetY()*window.devicePixelRatio;var rotateX=this._transformController.rotateX();var rotateY=this._transformController.rotateY();return new WebKitCSSMatrix().translate(offsetX,offsetY,0).scale(scale,scale,scale).translate(canvasWidth/2,canvasHeight/2,0).rotate(rotateX,rotateY,0).scale(viewScale,viewScale,viewScale).translate(-rootWidth/2,-rootHeight/2,0);},_initProjectionMatrix:function()
+{this._pMatrix=new WebKitCSSMatrix().scale(1,-1,-1).translate(-1,-1,0).scale(2/this._canvasElement.width,2/this._canvasElement.height,1/1000000).multiply(this._calculateProjectionMatrix());this._gl.uniformMatrix4fv(this._shaderProgram.pMatrixUniform,false,this._arrayFromMatrix(this._pMatrix));},_handleLoadedTexture:function(texture,layerId)
+{this._gl.bindTexture(this._gl.TEXTURE_2D,texture);this._gl.pixelStorei(this._gl.UNPACK_FLIP_Y_WEBGL,true);this._gl.texImage2D(this._gl.TEXTURE_2D,0,this._gl.RGBA,this._gl.RGBA,this._gl.UNSIGNED_BYTE,texture.image);this._gl.texParameteri(this._gl.TEXTURE_2D,this._gl.TEXTURE_MIN_FILTER,this._gl.LINEAR);this._gl.texParameteri(this._gl.TEXTURE_2D,this._gl.TEXTURE_MAG_FILTER,this._gl.LINEAR);this._gl.texParameteri(this._gl.TEXTURE_2D,this._gl.TEXTURE_WRAP_S,this._gl.CLAMP_TO_EDGE);this._gl.texParameteri(this._gl.TEXTURE_2D,this._gl.TEXTURE_WRAP_T,this._gl.CLAMP_TO_EDGE);this._gl.bindTexture(this._gl.TEXTURE_2D,null);this._textureForLayer={};this._textureForLayer[layerId]=texture;this._update();},_initWhiteTexture:function()
+{this._whiteTexture=this._gl.createTexture();this._gl.bindTexture(this._gl.TEXTURE_2D,this._whiteTexture);var whitePixel=new Uint8Array([255,255,255,255]);this._gl.texImage2D(this._gl.TEXTURE_2D,0,this._gl.RGBA,1,1,0,this._gl.RGBA,this._gl.UNSIGNED_BYTE,whitePixel);},_initGLIfNecessary:function()
+{if(this._gl)
+return this._gl;this._gl=this._initGL(this._canvasElement);this._initShaders();this._initWhiteTexture();return this._gl;},_arrayFromMatrix:function(m)
+{return new Float32Array([m.m11,m.m12,m.m13,m.m14,m.m21,m.m22,m.m23,m.m24,m.m31,m.m32,m.m33,m.m34,m.m41,m.m42,m.m43,m.m44]);},_makeColorsArray:function(color)
+{var colors=[];var normalizedColor=[color[0]/255,color[1]/255,color[2]/255,color[3]];for(var i=0;i<4;i++){colors=colors.concat(normalizedColor);}
+return colors;},_setVertexAttribute:function(attribute,array,length)
+{var gl=this._gl;var buffer=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,buffer);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(array),gl.STATIC_DRAW);gl.vertexAttribPointer(attribute,length,gl.FLOAT,false,0,0);},_drawRectangle:function(vertices,color,glMode,texture)
+{this._setVertexAttribute(this._shaderProgram.vertexPositionAttribute,vertices,3);this._setVertexAttribute(this._shaderProgram.textureCoordAttribute,[0,1,1,1,1,0,0,0],2);if(texture){var white=[255,255,255,1];this._setVertexAttribute(this._shaderProgram.vertexColorAttribute,this._makeColorsArray(white),white.length);this._gl.activeTexture(this._gl.TEXTURE0);this._gl.bindTexture(this._gl.TEXTURE_2D,texture);this._gl.uniform1i(this._shaderProgram.samplerUniform,0);}else{this._setVertexAttribute(this._shaderProgram.vertexColorAttribute,this._makeColorsArray(color),color.length);this._gl.bindTexture(this._gl.TEXTURE_2D,this._whiteTexture);}
+var numberOfVertices=4;this._gl.drawArrays(glMode,0,numberOfVertices);},_isObjectActive:function(type,layer,scrollRectIndex)
+{var activeObject=this._lastActiveObject[type];return activeObject&&activeObject.layer&&activeObject.layer.id()===layer.id()&&(typeof scrollRectIndex!=="number"||activeObject.scrollRectIndex===scrollRectIndex);},_colorsForLayer:function(layer)
+{var isSelected=this._isObjectActive(WebInspector.Layers3DView.OutlineType.Selected,layer);var isHovered=this._isObjectActive(WebInspector.Layers3DView.OutlineType.Hovered,layer);var color=isSelected?WebInspector.Layers3DView.SelectedBackgroundColor:WebInspector.Layers3DView.BackgroundColor;var borderColor=isHovered?WebInspector.Layers3DView.HoveredBorderColor:WebInspector.Layers3DView.BorderColor;return{color:color,borderColor:borderColor};},_calculateVerticesForQuad:function(quad,z)
+{return[quad[0],quad[1],z,quad[2],quad[3],z,quad[4],quad[5],z,quad[6],quad[7],z];},_calculatePointOnQuad:function(quad,ratioX,ratioY)
+{var x0=quad[0];var y0=quad[1];var x1=quad[2];var y1=quad[3];var x2=quad[4];var y2=quad[5];var x3=quad[6];var y3=quad[7];var firstSidePointX=x0+ratioX*(x1-x0);var firstSidePointY=y0+ratioX*(y1-y0);var thirdSidePointX=x3+ratioX*(x2-x3);var thirdSidePointY=y3+ratioX*(y2-y3);var x=firstSidePointX+ratioY*(thirdSidePointX-firstSidePointX);var y=firstSidePointY+ratioY*(thirdSidePointY-firstSidePointY);return[x,y];},_calculateRectQuad:function(layer,rect)
+{var quad=layer.quad();var rx1=rect.x/layer.width();var rx2=(rect.x+rect.width)/layer.width();var ry1=rect.y/layer.height();var ry2=(rect.y+rect.height)/layer.height();return this._calculatePointOnQuad(quad,rx1,ry1).concat(this._calculatePointOnQuad(quad,rx2,ry1)).concat(this._calculatePointOnQuad(quad,rx2,ry2)).concat(this._calculatePointOnQuad(quad,rx1,ry2));},_calculateScrollRectQuadsForLayer:function(layer)
+{var quads=[];for(var i=0;i<layer.scrollRects().length;++i)
+quads.push(this._calculateRectQuad(layer,layer.scrollRects()[i].rect));return quads;},_calculateScrollRectDepth:function(layer,index)
+{return this._depthByLayerId[layer.id()]*WebInspector.Layers3DView.LayerSpacing+index*WebInspector.Layers3DView.ScrollRectSpacing+1;},_drawLayer:function(layer)
+{var gl=this._gl;var vertices;if(this._isVisible[layer.id()]){vertices=this._calculateVerticesForQuad(layer.quad(),this._depthByLayerId[layer.id()]*WebInspector.Layers3DView.LayerSpacing);var colors=this._colorsForLayer(layer);this._drawRectangle(vertices,colors.color,gl.TRIANGLE_FAN,this._textureForLayer[layer.id()]);this._drawRectangle(vertices,colors.borderColor,gl.LINE_LOOP);}
+this._scrollRectQuadsForLayer[layer.id()]=this._calculateScrollRectQuadsForLayer(layer);var scrollRectQuads=this._scrollRectQuadsForLayer[layer.id()];for(var i=0;i<scrollRectQuads.length;++i){vertices=this._calculateVerticesForQuad(scrollRectQuads[i],this._calculateScrollRectDepth(layer,i));var isSelected=this._isObjectActive(WebInspector.Layers3DView.OutlineType.Selected,layer,i);var color=isSelected?WebInspector.Layers3DView.SelectedScrollRectBackgroundColor:WebInspector.Layers3DView.ScrollRectBackgroundColor;this._drawRectangle(vertices,color,gl.TRIANGLE_FAN);this._drawRectangle(vertices,WebInspector.Layers3DView.ScrollRectBorderColor,gl.LINE_LOOP);}},_calculateDepths:function()
+{this._depthByLayerId={};this._isVisible={};var depth=0;var root=this._model.root();var queue=[root];this._depthByLayerId[root.id()]=0;this._isVisible[root.id()]=false;while(queue.length>0){var layer=queue.shift();var children=layer.children();for(var i=0;i<children.length;++i){this._depthByLayerId[children[i].id()]=++depth;this._isVisible[children[i].id()]=children[i]===this._model.contentRoot()||this._isVisible[layer.id()];queue.push(children[i]);}}},_update:function()
+{if(!this.isShowing()){this._needsUpdate=true;return;}
+if(!this._model.contentRoot()){this._emptyView.show(this.element);return;}
+this._emptyView.detach();var gl=this._initGLIfNecessary();this._resizeCanvas();this._initProjectionMatrix();this._calculateDepths();gl.viewport(0,0,gl.viewportWidth,gl.viewportHeight);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);this._model.forEachLayer(this._drawLayer.bind(this),this._model.root());},_onLayerPainted:function(event)
+{this._update();},_intersectLineAndRect:function(vertices,matrix,x0,y0)
+{var epsilon=1e-8;var i;var points=[];for(i=0;i<4;++i)
+points[i]=WebInspector.Geometry.multiplyVectorByMatrixAndNormalize(new WebInspector.Geometry.Vector(vertices[i*3],vertices[i*3+1],vertices[i*3+2]),matrix);var normal=WebInspector.Geometry.crossProduct(WebInspector.Geometry.subtract(points[1],points[0]),WebInspector.Geometry.subtract(points[2],points[1]));var A=normal.x;var B=normal.y;var C=normal.z;var D=-(A*points[0].x+B*points[0].y+C*points[0].z);var t=-(D+A*x0+B*y0)/C;var pt=new WebInspector.Geometry.Vector(x0,y0,t);var tVects=points.map(WebInspector.Geometry.subtract.bind(null,pt));for(i=0;i<tVects.length;++i){var product=WebInspector.Geometry.scalarProduct(normal,WebInspector.Geometry.crossProduct(tVects[i],tVects[(i+1)%tVects.length]));if(product<0)
+return undefined;}
+return t;},_layerFromEventPoint:function(event)
+{if(!this._model.contentRoot())
+return null;var closestIntersectionPoint=Infinity;var closestLayer=null;var projectionMatrix=new WebKitCSSMatrix().scale(1,-1,-1).translate(-1,-1,0).multiply(this._calculateProjectionMatrix());var x0=(event.clientX-this._canvasElement.totalOffsetLeft())*window.devicePixelRatio;var y0=-(event.clientY-this._canvasElement.totalOffsetTop())*window.devicePixelRatio;function checkIntersection(layer)
+{var t;if(this._isVisible[layer.id()]){t=this._intersectLineAndRect(this._calculateVerticesForQuad(layer.quad(),this._depthByLayerId[layer.id()]*WebInspector.Layers3DView.LayerSpacing),projectionMatrix,x0,y0);if(t<closestIntersectionPoint){closestIntersectionPoint=t;closestLayer={layer:layer};}}
+var scrollRectQuads=this._scrollRectQuadsForLayer[layer.id()];for(var i=0;i<scrollRectQuads.length;++i){t=this._intersectLineAndRect(this._calculateVerticesForQuad(scrollRectQuads[i],this._calculateScrollRectDepth(layer,i)),projectionMatrix,x0,y0);if(t<closestIntersectionPoint){closestIntersectionPoint=t;closestLayer={layer:layer,scrollRectIndex:i};}}}
+this._model.forEachLayer(checkIntersection.bind(this),this._model.root());return closestLayer;},_onContextMenu:function(event)
+{var layer=this._layerFromEventPoint(event).layer;var node=layer?layer.nodeForSelfOrAncestor():null;var contextMenu=new WebInspector.ContextMenu(event);contextMenu.appendItem("Reset view",this._transformController._resetAndNotify.bind(this._transformController),false);if(node)
+contextMenu.appendApplicableItems(node);contextMenu.show();},_onMouseMove:function(event)
+{if(event.which)
+return;this.dispatchEventToListeners(WebInspector.Layers3DView.Events.ObjectHovered,this._layerFromEventPoint(event));},_onMouseDown:function(event)
+{this._mouseDownX=event.clientX;this._mouseDownY=event.clientY;},_onMouseUp:function(event)
+{const maxDistanceInPixels=6;if(this._mouseDownX&&Math.abs(event.clientX-this._mouseDownX)<maxDistanceInPixels&&Math.abs(event.clientY-this._mouseDownY)<maxDistanceInPixels)
+this.dispatchEventToListeners(WebInspector.Layers3DView.Events.ObjectSelected,this._layerFromEventPoint(event));delete this._mouseDownX;delete this._mouseDownY;},_onDoubleClick:function(event)
+{var object=this._layerFromEventPoint(event);if(object&&object.layer)
+this.dispatchEventToListeners(WebInspector.Layers3DView.Events.LayerSnapshotRequested,object.layer);event.stopPropagation();},__proto__:WebInspector.VBox.prototype};WebInspector.LayerDetailsView=function(model)
+{WebInspector.VBox.call(this);this.element.classList.add("layer-details-view");this._emptyView=new WebInspector.EmptyView(WebInspector.UIString("Select a layer to see its details"));this._createTable();this._model=model;this._model.addEventListener(WebInspector.LayerTreeModel.Events.LayerTreeChanged,this._onLayerTreeUpdated,this);this._model.addEventListener(WebInspector.LayerTreeModel.Events.LayerPainted,this._onLayerPainted,this);}
+WebInspector.LayerDetailsView.Events={ObjectSelected:"ObjectSelected"}
+WebInspector.LayerDetailsView.CompositingReasonDetail={"transform3D":WebInspector.UIString("Composition due to association with an element with a CSS 3D transform."),"video":WebInspector.UIString("Composition due to association with a <video> element."),"canvas":WebInspector.UIString("Composition due to the element being a <canvas> element."),"plugin":WebInspector.UIString("Composition due to association with a plugin."),"iFrame":WebInspector.UIString("Composition due to association with an <iframe> element."),"backfaceVisibilityHidden":WebInspector.UIString("Composition due to association with an element with a \"backface-visibility: hidden\" style."),"animation":WebInspector.UIString("Composition due to association with an animated element."),"filters":WebInspector.UIString("Composition due to association with an element with CSS filters applied."),"positionFixed":WebInspector.UIString("Composition due to association with an element with a \"position: fixed\" style."),"positionSticky":WebInspector.UIString("Composition due to association with an element with a \"position: sticky\" style."),"overflowScrollingTouch":WebInspector.UIString("Composition due to association with an element with a \"overflow-scrolling: touch\" style."),"blending":WebInspector.UIString("Composition due to association with an element that has blend mode other than \"normal\"."),"assumedOverlap":WebInspector.UIString("Composition due to association with an element that may overlap other composited elements."),"overlap":WebInspector.UIString("Composition due to association with an element overlapping other composited elements."),"negativeZIndexChildren":WebInspector.UIString("Composition due to association with an element with descendants that have a negative z-index."),"transformWithCompositedDescendants":WebInspector.UIString("Composition due to association with an element with composited descendants."),"opacityWithCompositedDescendants":WebInspector.UIString("Composition due to association with an element with opacity applied and composited descendants."),"maskWithCompositedDescendants":WebInspector.UIString("Composition due to association with a masked element and composited descendants."),"reflectionWithCompositedDescendants":WebInspector.UIString("Composition due to association with an element with a reflection and composited descendants."),"filterWithCompositedDescendants":WebInspector.UIString("Composition due to association with an element with CSS filters applied and composited descendants."),"blendingWithCompositedDescendants":WebInspector.UIString("Composition due to association with an element with CSS blending applied and composited descendants."),"clipsCompositingDescendants":WebInspector.UIString("Composition due to association with an element clipping compositing descendants."),"perspective":WebInspector.UIString("Composition due to association with an element with perspective applied."),"preserve3D":WebInspector.UIString("Composition due to association with an element with a \"transform-style: preserve-3d\" style."),"root":WebInspector.UIString("Root layer."),"layerForClip":WebInspector.UIString("Layer for clip."),"layerForScrollbar":WebInspector.UIString("Layer for scrollbar."),"layerForScrollingContainer":WebInspector.UIString("Layer for scrolling container."),"layerForForeground":WebInspector.UIString("Layer for foreground."),"layerForBackground":WebInspector.UIString("Layer for background."),"layerForMask":WebInspector.UIString("Layer for mask."),"layerForVideoOverlay":WebInspector.UIString("Layer for video overlay.")};WebInspector.LayerDetailsView.prototype={setObject:function(activeObject)
+{this._layer=activeObject?activeObject.layer:null;this._scrollRectIndex=activeObject?activeObject.scrollRectIndex:null;if(this.isShowing())
+this._update();},wasShown:function()
+{WebInspector.View.prototype.wasShown.call(this);this._update();},_onLayerTreeUpdated:function()
+{if(this.isShowing())
+this._update();},_onLayerPainted:function(event)
+{var layer=(event.data);if(this._layer===layer)
+this._paintCountCell.textContent=layer.paintCount();},_onScrollRectClicked:function(index,event)
+{if(event.which!==1)
+return;this.dispatchEventToListeners(WebInspector.LayerDetailsView.Events.ObjectSelected,{layer:this._layer,scrollRectIndex:index});},_createScrollRectElement:function(scrollRect,index)
+{if(index)
+this._scrollRectsCell.createTextChild(", ");var element=this._scrollRectsCell.createChild("span");element.className=index===this._scrollRectIndex?"scroll-rect active":"scroll-rect";element.textContent=WebInspector.LayerTreeModel.ScrollRectType[scrollRect.type].description+" ("+scrollRect.rect.x+", "+scrollRect.rect.y+", "+scrollRect.rect.width+", "+scrollRect.rect.height+")";element.addEventListener("click",this._onScrollRectClicked.bind(this,index),false);},_update:function()
+{if(!this._layer){this._tableElement.remove();this._emptyView.show(this.element);return;}
+this._emptyView.detach();this.element.appendChild(this._tableElement);this._positionCell.textContent=WebInspector.UIString("%d,%d",this._layer.offsetX(),this._layer.offsetY());this._sizeCell.textContent=WebInspector.UIString("%d × %d",this._layer.width(),this._layer.height());this._paintCountCell.textContent=this._layer.paintCount();const bytesPerPixel=4;this._memoryEstimateCell.textContent=Number.bytesToString(this._layer.invisible()?0:this._layer.width()*this._layer.height()*bytesPerPixel);this._layer.requestCompositingReasons(this._updateCompositingReasons.bind(this));this._scrollRectsCell.removeChildren();this._layer.scrollRects().forEach(this._createScrollRectElement.bind(this));},_createTable:function()
+{this._tableElement=this.element.createChild("table");this._tbodyElement=this._tableElement.createChild("tbody");this._positionCell=this._createRow(WebInspector.UIString("Position in parent:"));this._sizeCell=this._createRow(WebInspector.UIString("Size:"));this._compositingReasonsCell=this._createRow(WebInspector.UIString("Compositing Reasons:"));this._memoryEstimateCell=this._createRow(WebInspector.UIString("Memory estimate:"));this._paintCountCell=this._createRow(WebInspector.UIString("Paint count:"));this._scrollRectsCell=this._createRow(WebInspector.UIString("Slow scroll regions:"));},_createRow:function(title)
+{var tr=this._tbodyElement.createChild("tr");var titleCell=tr.createChild("td");titleCell.textContent=title;return tr.createChild("td");},_updateCompositingReasons:function(compositingReasons)
+{if(!compositingReasons||!compositingReasons.length){this._compositingReasonsCell.textContent="n/a";return;}
+var fragment=document.createDocumentFragment();for(var i=0;i<compositingReasons.length;++i){if(i)
+fragment.appendChild(document.createTextNode(","));var span=document.createElement("span");span.title=WebInspector.LayerDetailsView.CompositingReasonDetail[compositingReasons[i]]||"";span.textContent=compositingReasons[i];fragment.appendChild(span);}
+this._compositingReasonsCell.removeChildren();this._compositingReasonsCell.appendChild(fragment);},__proto__:WebInspector.VBox.prototype};WebInspector.PaintProfilerView=function(model,layers3DView)
+{WebInspector.VBox.call(this);this.element.classList.add("paint-profiler-view");this._model=model;this._layers3DView=layers3DView;this._canvas=this.element.createChild("canvas","fill");this._context=this._canvas.getContext("2d");this._selectionWindow=new WebInspector.OverviewGrid.Window(this.element,this.element);this._selectionWindow.addEventListener(WebInspector.OverviewGrid.Events.WindowChanged,this._onWindowChanged,this);this._innerBarWidth=4*window.devicePixelRatio;this._minBarHeight=4*window.devicePixelRatio;this._barPaddingWidth=2*window.devicePixelRatio;this._outerBarWidth=this._innerBarWidth+this._barPaddingWidth;this._reset();}
+WebInspector.PaintProfilerView.prototype={onResize:function()
+{this._update();},_update:function()
+{this._canvas.width=this.element.clientWidth*window.devicePixelRatio;this._canvas.height=this.element.clientHeight*window.devicePixelRatio;this._samplesPerBar=0;if(!this._profiles||!this._profiles.length)
+return;var maxBars=Math.floor((this._canvas.width-2*this._barPaddingWidth)/this._outerBarWidth);var sampleCount=this._profiles[0].length;this._samplesPerBar=Math.ceil(sampleCount/maxBars);var barCount=Math.floor(sampleCount/this._samplesPerBar);var maxBarTime=0;var barTimes=[];for(var i=0,lastBarIndex=0,lastBarTime=0;i<sampleCount;){for(var row=0;row<this._profiles.length;row++)
+lastBarTime+=this._profiles[row][i];++i;if(i-lastBarIndex==this._samplesPerBar||i==sampleCount){lastBarTime/=this._profiles.length*(i-lastBarIndex);barTimes.push(lastBarTime);if(lastBarTime>maxBarTime)
+maxBarTime=lastBarTime;lastBarTime=0;lastBarIndex=i;}}
+const paddingHeight=4*window.devicePixelRatio;var scale=(this._canvas.height-paddingHeight-this._minBarHeight)/maxBarTime;this._context.fillStyle="rgba(110, 180, 110, 0.7)";for(var i=0;i<barTimes.length;++i)
+this._renderBar(i,barTimes[i]*scale+this._minBarHeight);},_renderBar:function(index,height)
+{var x=this._barPaddingWidth+index*this._outerBarWidth;var y=this._canvas.height-height;this._context.fillRect(x,y,this._innerBarWidth,height);},_onWindowChanged:function()
+{if(this._updateImageTimer)
+return;this._updateImageTimer=setTimeout(this._updateImage.bind(this),100);},_updateImage:function()
+{delete this._updateImageTimer;if(!this._profiles||!this._profiles.length)
+return;var screenLeft=this._selectionWindow.windowLeft*this._canvas.width;var screenRight=this._selectionWindow.windowRight*this._canvas.width;var barLeft=Math.floor((screenLeft-this._barPaddingWidth)/this._outerBarWidth);var barRight=Math.floor((screenRight-this._barPaddingWidth+this._innerBarWidth)/this._outerBarWidth);var stepLeft=Math.max(0,barLeft*this._samplesPerBar);var stepRight=Math.min(barRight*this._samplesPerBar,this._profiles[0].length);this._snapshot.requestImage(stepLeft,stepRight,this._layers3DView.showImageForLayer.bind(this._layers3DView,this._layer));},_reset:function()
+{this._snapshot=null;this._profiles=null;this._selectionWindow.reset();},profile:function(layer)
+{this._reset();this._layer=layer;this._layer.requestSnapshot(onSnapshotDone.bind(this));function onSnapshotDone(snapshot)
+{this._snapshot=snapshot;if(!snapshot){this._profiles=null;this._update();return;}
+snapshot.requestImage(null,null,this._layers3DView.showImageForLayer.bind(this._layers3DView,this._layer));snapshot.profile(onProfileDone.bind(this));}
+function onProfileDone(profiles)
+{this._profiles=profiles;this._update();}},__proto__:WebInspector.VBox.prototype};;WebInspector.TransformController=function(element)
+{this.element=element;element.addEventListener("mousemove",this._onMouseMove.bind(this),false);element.addEventListener("mousedown",this._onMouseDown.bind(this),false);element.addEventListener("mouseup",this._onMouseUp.bind(this),false);element.addEventListener("mousewheel",this._onMouseWheel.bind(this),false);this._reset();}
+WebInspector.TransformController.Events={TransformChanged:"TransformChanged"}
+WebInspector.TransformController.prototype={registerShortcuts:function(registerShortcutDelegate)
+{registerShortcutDelegate(WebInspector.ShortcutsScreen.LayersPanelShortcuts.ResetView,this._resetAndNotify.bind(this));var zoomFactor=1.1;registerShortcutDelegate(WebInspector.ShortcutsScreen.LayersPanelShortcuts.ZoomIn,this._onKeyboardZoom.bind(this,zoomFactor));registerShortcutDelegate(WebInspector.ShortcutsScreen.LayersPanelShortcuts.ZoomOut,this._onKeyboardZoom.bind(this,1/zoomFactor));var panDistanceInPixels=6;registerShortcutDelegate(WebInspector.ShortcutsScreen.LayersPanelShortcuts.PanUp,this._onPan.bind(this,0,-panDistanceInPixels));registerShortcutDelegate(WebInspector.ShortcutsScreen.LayersPanelShortcuts.PanDown,this._onPan.bind(this,0,panDistanceInPixels));registerShortcutDelegate(WebInspector.ShortcutsScreen.LayersPanelShortcuts.PanLeft,this._onPan.bind(this,-panDistanceInPixels,0));registerShortcutDelegate(WebInspector.ShortcutsScreen.LayersPanelShortcuts.PanRight,this._onPan.bind(this,panDistanceInPixels,0));var rotateDegrees=5;registerShortcutDelegate(WebInspector.ShortcutsScreen.LayersPanelShortcuts.RotateCWX,this._onKeyboardRotate.bind(this,rotateDegrees,0));registerShortcutDelegate(WebInspector.ShortcutsScreen.LayersPanelShortcuts.RotateCCWX,this._onKeyboardRotate.bind(this,-rotateDegrees,0));registerShortcutDelegate(WebInspector.ShortcutsScreen.LayersPanelShortcuts.RotateCWY,this._onKeyboardRotate.bind(this,0,-rotateDegrees));registerShortcutDelegate(WebInspector.ShortcutsScreen.LayersPanelShortcuts.RotateCCWY,this._onKeyboardRotate.bind(this,0,rotateDegrees));},_postChangeEvent:function()
+{this.dispatchEventToListeners(WebInspector.TransformController.Events.TransformChanged);},_reset:function()
+{this._scale=1;this._offsetX=0;this._offsetY=0;this._rotateX=0;this._rotateY=0;},_resetAndNotify:function(event)
+{this._reset();this._postChangeEvent();if(event)
+event.preventDefault();},scale:function()
+{return this._scale;},offsetX:function()
+{return this._offsetX;},offsetY:function()
+{return this._offsetY;},rotateX:function()
+{return this._rotateX;},rotateY:function()
+{return this._rotateY;},_onScale:function(scaleFactor,x,y)
+{this._scale*=scaleFactor;this._offsetX-=(x-this._offsetX)*(scaleFactor-1);this._offsetY-=(y-this._offsetY)*(scaleFactor-1);this._postChangeEvent();},_onPan:function(offsetX,offsetY)
+{this._offsetX+=offsetX;this._offsetY+=offsetY;this._postChangeEvent();},_onRotate:function(rotateX,rotateY)
+{this._rotateX=rotateX;this._rotateY=rotateY;this._postChangeEvent();},_onKeyboardZoom:function(zoomFactor)
+{this._onScale(zoomFactor,this.element.clientWidth/2,this.element.clientHeight/2);},_onKeyboardRotate:function(rotateX,rotateY)
+{this._onRotate(this._rotateX+rotateX,this._rotateY+rotateY);},_onMouseWheel:function(event)
+{if(!event.altKey){var zoomFactor=1.1;var mouseWheelZoomSpeed=1/120;var scaleFactor=Math.pow(zoomFactor,event.wheelDeltaY*mouseWheelZoomSpeed);this._onScale(scaleFactor,event.clientX-this.element.totalOffsetLeft(),event.clientY-this.element.totalOffsetTop());}else{var moveFactor=1/20;this._onPan(event.wheelDeltaX*moveFactor,event.wheelDeltaY*moveFactor);}},_onMouseMove:function(event)
+{if(event.which!==1||typeof this._originX!=="number")
+return;this._onRotate(this._oldRotateX+(this._originY-event.clientY)/this.element.clientHeight*180,this._oldRotateY-(this._originX-event.clientX)/this.element.clientWidth*180);},_setReferencePoint:function(event)
+{this._originX=event.clientX;this._originY=event.clientY;this._oldRotateX=this._rotateX;this._oldRotateY=this._rotateY;},_resetReferencePoint:function()
+{delete this._originX;delete this._originY;delete this._oldRotateX;delete this._oldRotateY;},_onMouseDown:function(event)
+{if(event.which!==1)
+return;this._setReferencePoint(event);},_onMouseUp:function(event)
+{if(event.which!==1)
+return;this._resetReferencePoint();},__proto__:WebInspector.Object.prototype};WebInspector.LayersPanel=function()
+{WebInspector.PanelWithSidebarTree.call(this,"layers",225);this.registerRequiredCSS("layersPanel.css");this.sidebarElement().classList.add("outline-disclosure");this.sidebarTree.element.classList.remove("sidebar-tree");this._target=(WebInspector.targetManager.activeTarget());this._model=new WebInspector.LayerTreeModel(this._target);this._model.addEventListener(WebInspector.LayerTreeModel.Events.LayerTreeChanged,this._onLayerTreeUpdated,this);this._currentlySelectedLayer=null;this._currentlyHoveredLayer=null;this._layerTree=new WebInspector.LayerTree(this._model,this.sidebarTree);this._layerTree.addEventListener(WebInspector.LayerTree.Events.LayerSelected,this._onObjectSelected,this);this._layerTree.addEventListener(WebInspector.LayerTree.Events.LayerHovered,this._onObjectHovered,this);this._rightSplitView=new WebInspector.SplitView(false,true,"layerDetailsSplitViewState");this._rightSplitView.show(this.mainElement());this._layers3DView=new WebInspector.Layers3DView(this._model);this._layers3DView.show(this._rightSplitView.mainElement());this._layers3DView.addEventListener(WebInspector.Layers3DView.Events.ObjectSelected,this._onObjectSelected,this);this._layers3DView.addEventListener(WebInspector.Layers3DView.Events.ObjectHovered,this._onObjectHovered,this);this._layers3DView.addEventListener(WebInspector.Layers3DView.Events.LayerSnapshotRequested,this._onSnapshotRequested,this);this._layers3DView.registerShortcuts(this.registerShortcuts.bind(this));this._tabbedPane=new WebInspector.TabbedPane();this._tabbedPane.show(this._rightSplitView.sidebarElement());this._layerDetailsView=new WebInspector.LayerDetailsView(this._model);this._layerDetailsView.addEventListener(WebInspector.LayerDetailsView.Events.ObjectSelected,this._onObjectSelected,this);this._tabbedPane.appendTab(WebInspector.LayersPanel.DetailsViewTabs.Details,WebInspector.UIString("Details"),this._layerDetailsView);this._paintProfilerView=new WebInspector.PaintProfilerView(this._model,this._layers3DView);this._tabbedPane.appendTab(WebInspector.LayersPanel.DetailsViewTabs.Profiler,WebInspector.UIString("Profiler"),this._paintProfilerView);}
+WebInspector.LayersPanel.ActiveObject;WebInspector.LayersPanel.DetailsViewTabs={Details:"details",Profiler:"profiler"};WebInspector.LayersPanel.prototype={wasShown:function()
+{WebInspector.Panel.prototype.wasShown.call(this);this.sidebarTree.element.focus();this._model.enable();},willHide:function()
+{this._model.disable();WebInspector.Panel.prototype.willHide.call(this);},_showSnapshot:function(snapshot)
+{this._model.setSnapshot(snapshot);},_showTracingSnapshot:function(snapshot)
+{this._model.setTracingSnapshot(snapshot);},_onLayerTreeUpdated:function()
+{if(this._currentlySelectedLayer&&!this._model.layerById(this._currentlySelectedLayer.layer.id()))
+this._selectObject(null);if(this._currentlyHoveredLayer&&!this._model.layerById(this._currentlyHoveredLayer.layer.id()))
+this._hoverObject(null);},_onObjectSelected:function(event)
+{var activeObject=(event.data);this._selectObject(activeObject);},_onObjectHovered:function(event)
+{var activeObject=(event.data);this._hoverObject(activeObject);},_onSnapshotRequested:function(event)
+{var layer=(event.data);this._tabbedPane.selectTab(WebInspector.LayersPanel.DetailsViewTabs.Profiler);this._paintProfilerView.profile(layer);},_selectObject:function(activeObject)
+{var layer=activeObject&&activeObject.layer;if(this._currentlySelectedLayer===activeObject)
+return;this._currentlySelectedLayer=activeObject;var node=layer?layer.nodeForSelfOrAncestor():null;if(node)
+node.highlightForTwoSeconds();else
+this._target.domModel.hideDOMNodeHighlight();this._layerTree.selectLayer(layer);this._layers3DView.selectObject(activeObject);this._layerDetailsView.setObject(activeObject);},_hoverObject:function(activeObject)
+{var layer=activeObject&&activeObject.layer;if(this._currentlyHoveredLayer===activeObject)
+return;this._currentlyHoveredLayer=activeObject;var node=layer?layer.nodeForSelfOrAncestor():null;if(node)
+node.highlight();else
+this._target.domModel.hideDOMNodeHighlight();this._layerTree.hoverLayer(layer);this._layers3DView.hoverObject(activeObject);},__proto__:WebInspector.PanelWithSidebarTree.prototype}
+WebInspector.LayersPanel.LayerTreeRevealer=function()
+{}
+WebInspector.LayersPanel.LayerTreeRevealer.prototype={reveal:function(snapshotData)
+{if(snapshotData instanceof WebInspector.LayerTreeSnapshot)
+(WebInspector.inspectorView.showPanel("layers"))._showSnapshot(snapshotData);else if(snapshotData instanceof WebInspector.TracingLayerSnapshot)
+(WebInspector.inspectorView.showPanel("layers"))._showTracingSnapshot(snapshotData);}}

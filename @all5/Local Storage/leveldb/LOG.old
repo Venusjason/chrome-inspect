@@ -1,0 +1,4 @@
+2017/11/05-16:53:54.531 1264 Reusing MANIFEST leveldb/MANIFEST-000001
+2017/11/05-16:53:54.533 1264 Recovering log #4
+2017/11/05-16:53:54.658 1264 Reusing old log leveldb/000004.log 
+2017/11/05-16:53:54.659 1264 Delete type=0 #3
